@@ -1,3 +1,5 @@
+import asyncio
+import copy
 import logging
 import os
 import time
@@ -345,17 +347,28 @@ class OpenAIChatCompletion(LocalChatCompletion):
         return output
 
 
-class OpenRouterResponse:
-    """包装OpenRouter响应和统计信息的类"""
+class OpenRouterResponse(str):
+    """包装OpenRouter响应和统计信息的类，继承自str以确保与正则表达式兼容"""
+    def __new__(cls, text: str, stats: dict = None):
+        # 创建str实例
+        instance = str.__new__(cls, text)
+        return instance
+
     def __init__(self, text: str, stats: dict = None):
-        self.text = text
+        # 注意：不能调用super().__init__()，因为str的__init__不接受参数
         self.stats = stats or {}
 
-    def __str__(self):
-        return self.text
-
     def __repr__(self):
-        return f"OpenRouterResponse(text='{self.text[:50]}...', stats={self.stats})"
+        return f"OpenRouterResponse(text='{str(self)[:50]}...', stats={self.stats})"
+
+    @property
+    def text(self):
+        """兼容性属性：返回字符串内容本身"""
+        return str(self)
+
+
+
+
 
 
 @register_model("openrouter-chat-completions")
@@ -378,10 +391,45 @@ class OpenRouterChatCompletion(OpenAIChatCompletion):
         self.is_openrouter = True
         self.generation_stats = []
 
+    def _create_payload(
+        self,
+        messages: List[Dict],
+        generate=False,
+        gen_kwargs: dict = None,
+        seed=1234,
+        eos="<|endoftext|>",
+        **kwargs,
+    ) -> dict:
+        """重写payload创建方法以适配OpenRouter API"""
+        assert type(messages) is not str, (
+            "chat-completions require the --apply_chat_template flag."
+        )
+        gen_kwargs.pop("do_sample", False)
+        # Remove max_gen_toks parameter but don't use it - let API use default
+        gen_kwargs.pop("max_gen_toks", None)
+        temperature = gen_kwargs.pop("temperature", 0)
+        stop = handle_stop_sequences(gen_kwargs.pop("until", ["<|endoftext|>"]), eos)
+        if not isinstance(stop, (list, tuple)):
+            stop = [stop]
+
+        # 不设置max_tokens参数，让OpenRouter API使用默认调度
+        # 移除max_tokens以确保使用API默认值
+        gen_kwargs.pop("max_tokens", None)
+
+        output = {
+            "messages": messages,
+            "model": self.model,
+            "temperature": temperature,
+            "stop": stop[:4],
+            "seed": seed,
+            **gen_kwargs,
+        }
+
+        return output
+
     def _get_openrouter_stats(self, generation_id: str) -> Dict[str, Any]:
-        """获取OpenRouter生成统计信息，支持重试机制（最多重试5次）"""
+        """获取OpenRouter生成统计信息，支持无限重试机制"""
         @retry(
-            stop=stop_after_attempt(5),
             wait=wait_exponential(multiplier=0.5, min=1, max=10),
             reraise=False
         )
@@ -396,7 +444,7 @@ class OpenRouterChatCompletion(OpenAIChatCompletion):
             # 等待一小段时间确保统计信息可用
             time.sleep(0.5)
 
-            response = requests.get(url, headers=headers, params=params, timeout=10)
+            response = requests.get(url, headers=headers, params=params, timeout=self.timeout)
             if response.status_code == 200:
                 result = response.json()
                 data = result.get("data", {})
@@ -423,6 +471,139 @@ class OpenRouterChatCompletion(OpenAIChatCompletion):
         except Exception as e:
             eval_logger.warning(f"获取OpenRouter统计信息失败: {e}")
             return {}
+
+    async def _get_openrouter_stats_async(self, generation_id: str) -> Dict[str, Any]:
+        """异步获取OpenRouter生成统计信息，支持无限重试机制"""
+        import aiohttp
+
+        @retry(
+            wait=wait_exponential(multiplier=0.5, min=1, max=10),
+            reraise=False
+        )
+        async def _fetch_stats_async():
+            url = "https://openrouter.ai/api/v1/generation"
+            headers = {
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json"
+            }
+            params = {"id": generation_id}
+
+            # 等待一小段时间确保统计信息可用
+            await asyncio.sleep(0.5)
+
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, headers=headers, params=params, timeout=self.timeout) as response:
+                    if response.status == 200:
+                        result = await response.json()
+                        data = result.get("data", {})
+                        return {
+                            "total_cost": data.get("total_cost", 0),
+                            "prompt_tokens": data.get("tokens_prompt", 0),
+                            "completion_tokens": data.get("tokens_completion", 0),
+                            "generation_time": data.get("generation_time", 0),
+                            "latency": data.get("latency", 0),
+                            "model": data.get("model", ""),
+                            "provider_name": data.get("provider_name", ""),
+                            "finish_reason": data.get("finish_reason", ""),
+                            "native_tokens_prompt": data.get("native_tokens_prompt", 0),
+                            "native_tokens_completion": data.get("native_tokens_completion", 0)
+                        }
+                    else:
+                        # 非200状态码时抛出异常以触发重试
+                        eval_logger.warning(f"OpenRouter统计API返回状态码: {response.status}, 响应: {await response.text()}")
+                        response.raise_for_status()
+
+        try:
+            result = await _fetch_stats_async()
+            return result if result is not None else {}
+        except Exception as e:
+            eval_logger.warning(f"异步获取OpenRouter统计信息失败: {e}")
+            return {}
+
+    async def amodel_call(
+        self,
+        session,
+        sem: "asyncio.Semaphore",
+        messages: Union[List[List[int]], List[str], List["JsonChatStr"]],
+        *,
+        generate: bool = True,
+        cache_keys: list = None,
+        ctxlens: Optional[List[int]] = None,
+        gen_kwargs: Optional[Dict] = None,
+        **kwargs,
+    ) -> Union[List[str], List[Tuple[float, bool]], None]:
+        """重写amodel_call方法以支持OpenRouter统计信息获取"""
+        import asyncio
+        import copy
+
+        # 复制gen_kwargs以避免修改原始数据
+        gen_kwargs = copy.deepcopy(gen_kwargs) if gen_kwargs else {}
+        payload = self._create_payload(
+            self.create_message(messages),
+            generate=generate,
+            gen_kwargs=gen_kwargs,
+            seed=self._seed,
+            **kwargs,
+        )
+        cache_method = "generate_until" if generate else "loglikelihood"
+        acquired = await sem.acquire()
+
+        try:
+            async with session.post(
+                self.base_url,
+                json=payload,
+                headers=self.header,
+            ) as response:
+                if not response.ok:
+                    error_text = await response.text()
+                    eval_logger.warning(
+                        f"API request failed! Status code: {response.status}, "
+                        f"Response text: {error_text}. Retrying..."
+                    )
+                response.raise_for_status()
+                outputs = await response.json()
+
+            # 收集OpenRouter统计信息
+            stats = None
+            if self.is_openrouter and generate:
+                generation_id = outputs.get("id")
+                if generation_id:
+                    try:
+                        stats = await self._get_openrouter_stats_async(generation_id)
+                        if stats:
+                            self.generation_stats.append(stats)
+                    except Exception as e:
+                        eval_logger.warning(f"异步获取OpenRouter统计信息失败: {e}")
+
+            answers = (
+                self.parse_generations(outputs=outputs)
+                if generate
+                else self.parse_logprobs(
+                    outputs=outputs,
+                    tokens=messages,
+                    ctxlens=ctxlens,
+                )
+            )
+
+            # 如果是OpenRouter且是生成任务，将答案包装成OpenRouterResponse对象
+            if self.is_openrouter and generate and answers:
+                wrapped_answers = []
+                for answer in answers:
+                    wrapped_answers.append(OpenRouterResponse(answer, stats))
+                answers = wrapped_answers
+
+            if cache_keys:
+                for res, cache in zip(answers, cache_keys):
+                    # 对于缓存，我们需要提取文本内容
+                    cache_content = str(res) if isinstance(res, OpenRouterResponse) else res
+                    self.cache_hook.add_partial(cache_method, cache, cache_content)
+            return answers
+        except BaseException as e:
+            eval_logger.error(f"Exception:{repr(e)}, retrying.")
+            raise e
+        finally:
+            if acquired:
+                sem.release()
 
     def model_call(
         self,
@@ -453,12 +634,12 @@ class OpenRouterChatCompletion(OpenAIChatCompletion):
         return response
 
     def generate_until(self, requests, disable_tqdm: bool = False):
-        """重写generate_until方法以支持统计信息传递"""
+        """重写generate_until方法以支持OpenRouter统计信息传递"""
         # 调用父类方法获取基本响应
         responses = super().generate_until(requests, disable_tqdm)
 
-        # 如果不是OpenRouter或没有统计信息，直接返回原始响应
-        if not self.is_openrouter or not self.generation_stats:
+        # 如果不是OpenRouter，直接返回原始响应
+        if not self.is_openrouter:
             return responses
 
         # 将统计信息附加到响应中
@@ -473,6 +654,8 @@ class OpenRouterChatCompletion(OpenAIChatCompletion):
                 enhanced_responses.append(OpenRouterResponse(response))
 
         return enhanced_responses
+
+
 
     def get_aggregated_stats(self) -> Dict[str, Any]:
         """获取聚合的统计信息"""

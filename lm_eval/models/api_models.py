@@ -134,7 +134,7 @@ class TemplateAPI(TemplateLM):
         verify_certificate: bool = True,
         eos_string: str = None,
         # timeout in seconds
-        timeout: int = 300,
+        timeout: int = 900,
         header: Optional[Dict[str, str]] = None,
         max_images: int = 1,
         **kwargs,
@@ -546,7 +546,6 @@ class TemplateAPI(TemplateLM):
             connector=conn, timeout=ClientTimeout(total=self.timeout)
         ) as session:
             retry_: Callable[..., Awaitable[Any]] = retry(
-                stop=stop_after_attempt(self.max_retries),
                 wait=wait_exponential(multiplier=0.5, min=1, max=10),
                 reraise=True,
                 before_sleep=lambda retry_state: eval_logger.info(
@@ -606,7 +605,6 @@ class TemplateAPI(TemplateLM):
                 inputs, ctxlens, cache_keys = self.batch_loglikelihood_requests([chunk])
 
                 outputs = retry(
-                    stop=stop_after_attempt(self.max_retries),
                     wait=wait_exponential(multiplier=0.5, min=1, max=10),
                     reraise=True,
                 )(self.model_call)(messages=inputs, generate=False)
@@ -713,7 +711,6 @@ class TemplateAPI(TemplateLM):
 
                 req = encodings_list if self.tokenized_requests else contexts
                 outputs = retry(
-                    stop=stop_after_attempt(self.max_retries),
                     wait=wait_exponential(multiplier=0.5, min=1, max=10),
                     reraise=True,
                 )(self.model_call)(

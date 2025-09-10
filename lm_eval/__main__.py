@@ -527,6 +527,22 @@ def cli_evaluate(args: Union[argparse.Namespace, None] = None) -> None:
         if "groups" in results:
             print(make_table(results, "groups"))
 
+        # 输出OpenRouter统计信息总结
+        if "openrouter_statistics" in results:
+            aggregated_stats = results["openrouter_statistics"]
+            if aggregated_stats:
+                print("\n" + "="*50)
+                print("OpenRouter Statistics Summary")
+                print("="*50)
+                print(f"Total Requests: {aggregated_stats.get('total_requests', 0)}")
+                print(f"Total Cost: ${aggregated_stats.get('total_cost', 0):.6f}")
+                print(f"Total Tokens: {aggregated_stats.get('total_tokens', 0):,}")
+                print(f"  - Prompt Tokens: {aggregated_stats.get('total_prompt_tokens', 0):,}")
+                print(f"  - Completion Tokens: {aggregated_stats.get('total_completion_tokens', 0):,}")
+                print(f"Average Latency: {aggregated_stats.get('average_latency', 0):.2f}ms")
+                print(f"Average Generation Time: {aggregated_stats.get('average_generation_time', 0):.2f}ms")
+                print("="*50)
+
         if args.wandb_args:
             # Tear down wandb run once all the logging is done.
             wandb_logger.run.finish()

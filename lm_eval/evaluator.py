@@ -411,6 +411,13 @@ def simple_evaluate(
         results["date"] = start_date
         add_env_info(results)  # additional environment info to results
         add_tokenizer_info(results, lm)  # additional info about tokenizer
+
+        # 添加OpenRouter统计信息到结果中
+        if hasattr(lm, 'get_aggregated_stats'):
+            aggregated_stats = lm.get_aggregated_stats()
+            if aggregated_stats:
+                results["openrouter_statistics"] = aggregated_stats
+
         return results
     else:
         return None

@@ -129,6 +129,13 @@ def handle_non_serializable(o):
         return int(o)
     elif isinstance(o, set):
         return list(o)
+    # 特殊处理OpenRouterResponse对象，保留统计信息
+    elif hasattr(o, 'stats') and isinstance(o, str) and type(o).__name__ == 'OpenRouterResponse':
+        # 这是OpenRouterResponse对象，将其转换为包含统计信息的字典
+        return {
+            'text': str(o),
+            'openrouter_stats': o.stats
+        }
     else:
         return str(o)
 
@@ -141,6 +148,14 @@ def sanitize_list(sub):
         return [sanitize_list(item) for item in sub]
     if isinstance(sub, tuple):
         return tuple(sanitize_list(item) for item in sub)
+    # 特殊处理OpenRouterResponse对象，直接转换为包含统计信息的字典
+    elif hasattr(sub, 'stats') and isinstance(sub, str) and type(sub).__name__ == 'OpenRouterResponse':
+        # 由于OpenRouterResponse继承自str，JSON序列化器不会调用default函数
+        # 因此我们在这里直接转换为字典格式
+        return {
+            'text': str(sub),
+            'openrouter_stats': sub.stats
+        }
     else:
         return str(sub)
 
